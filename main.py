@@ -8,6 +8,7 @@ import json
 import httpx
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 from dotenv import load_dotenv
 
 
@@ -24,6 +25,13 @@ DB_PATH = "alerts.db"
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
+
+main_kb = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="/add"), KeyboardButton(text="/list")],
+    ],
+    resize_keyboard=True,
+)
 
 
 # ---------- Работа с БД (SQLite) ----------
@@ -146,7 +154,7 @@ async def fetch_event_by_slug(slug: str) -> dict | None:
     if not events:
         return None
 
-    return events[0]  # первый event
+    return events[0]
 
 
 async def strike_exists_in_event(market_url: str, strike: int) -> bool:
@@ -188,7 +196,6 @@ def pick_token_id_for_outcome(event: dict, outcome_str: str) -> str | None:
     if not isinstance(markets, list) or not markets:
         return None
 
-    # Разбираем outcome: ожидаем что-то вроде "82000 yes"
     parts = outcome_str.strip().split()
     strike = None
     side_yes = True  # по умолчанию YES
@@ -204,7 +211,6 @@ def pick_token_id_for_outcome(event: dict, outcome_str: str) -> str | None:
 
     chosen_market = None
 
-    # Если есть страйк — пытаемся найти по groupItemTitle ("78,000", "86,000", ...)
     if strike is not None:
         for m in markets:
             title = str(m.get("groupItemTitle") or "")
@@ -217,7 +223,6 @@ def pick_token_id_for_outcome(event: dict, outcome_str: str) -> str | None:
                 chosen_market = m
                 break
 
-    # Если по страйку не нашли — лучше не падать в первый маркет, а вернуть None
     if chosen_market is None:
         return None
 
@@ -233,7 +238,6 @@ def pick_token_id_for_outcome(event: dict, outcome_str: str) -> str | None:
     if not isinstance(clob_ids, list) or len(clob_ids) < 2:
         return None
 
-    # 0 — YES, 1 — NO
     token_id = clob_ids[0] if side_yes else clob_ids[1]
     return str(token_id)
 
@@ -273,7 +277,8 @@ async def cmd_start(message: types.Message):
         "Команды:\n"
         "/add — добавить алерт\n"
         "/list — показать твои алерты\n"
-        "/delete <id> — удалить алерт"
+        "/delete <id> — удалить алерт",
+        reply_markup=main_kb,
     )
 
 
@@ -293,21 +298,22 @@ async def cmd_list(message: types.Message):
     alerts = get_user_alerts(user_id)
 
     if not alerts:
-        await message.answer("У тебя пока нет активных алертов.")
+        await message.answer("У тебя пока нет активных алертов.", reply_markup=main_kb)
         return
 
     lines = []
     for alert_id, market_url, outcome, target_price, direction in alerts:
+        cents = target_price * 100
         lines.append(
             f"ID: {alert_id}\n"
             f"Рынок: {market_url}\n"
             f"Исход: {outcome}\n"
-            f"Условие: цена {direction} {target_price}\n"
+            f"Условие: цена {direction} {target_price:.4f} ({cents:.1f}c)\n"
             f"/delete {alert_id}\n"
             f"---"
         )
 
-    await message.answer("\n".join(lines))
+    await message.answer("\n".join(lines), reply_markup=main_kb)
 
 
 @dp.message(Command("delete"))
@@ -327,9 +333,9 @@ async def cmd_delete(message: types.Message):
 
     ok = deactivate_alert(user_id=user_id, alert_id=alert_id)
     if ok:
-        await message.answer(f"Алерт с ID {alert_id} деактивирован.")
+        await message.answer(f"Алерт с ID {alert_id} деактивирован.", reply_markup=main_kb)
     else:
-        await message.answer("Не нашёл активный алерт с таким ID (возможны: уже удалён или чужой).")
+        await message.answer("Не нашёл активный алерт с таким ID (возможны: уже удалён или чужой).", reply_markup=main_kb)
 
 
 @dp.message()
@@ -360,7 +366,8 @@ async def handle_add_flow_or_default(message: types.Message):
         state["outcome"] = outcome
         state["step"] = 3
         await message.answer(
-            "3/3: укажи целевую цену в центах (например, 48 означает 0.48)."
+            "3/3: укажи целевую цену от 0 до 1.\n"
+            "Например, 0.61 означает 61c."
         )
         return
 
@@ -369,13 +376,16 @@ async def handle_add_flow_or_default(message: types.Message):
         try:
             target_price = float(message.text.replace(",", ".").strip())
         except ValueError:
-            await message.answer("Не понял число. Введи цену в формате типа 48 или 12.5.")
+            await message.answer("Не понял число. Введи цену в формате типа 0.48 или 0.125.")
+            return
+
+        if not (0.0 < target_price < 1.0):
+            await message.answer("Цена должна быть между 0 и 1, например 0.25 или 0.73.")
             return
 
         market_url = state["market_url"]
         outcome = state["outcome"]
 
-        # Пытаемся вытащить страйк из outcome (первое число)
         parts = outcome.strip().split()
         strike = None
         if parts:
@@ -392,7 +402,6 @@ async def handle_add_flow_or_default(message: types.Message):
             )
             return
 
-        # Проверяем, что такой страйк реально есть в событии Polymarket
         if not await strike_exists_in_event(market_url, strike):
             await message.answer(
                 "Похоже, в этом событии нет маркета с таким страйком.\n"
@@ -401,17 +410,17 @@ async def handle_add_flow_or_default(message: types.Message):
             )
             return
 
-        # Сохраняем в БД
         add_alert(user_id=user_id, market_url=market_url, outcome=outcome, target_price=target_price)
 
-        # Чистим состояние
         user_add_state.pop(user_id, None)
 
+        cents = target_price * 100
         await message.answer(
             f"Алерт добавлен!\n\n"
             f"Рынок: {market_url}\n"
             f"Исход: {outcome}\n"
-            f"Целевая цена: {target_price}"
+            f"Целевая цена: {target_price:.4f} ({cents:.1f}c)",
+            reply_markup=main_kb,
         )
         return
 
@@ -426,7 +435,7 @@ async def alerts_worker():
       - парсим slug события;
       - тянем событие из Gamma API и выбираем token_id;
       - по token_id берём текущую цену из CLOB API;
-      - сравниваем с target_price (в центах);
+      - сравниваем с target_price (0–1 доллара);
       - при выполнении условия шлём уведомление и деактивируем алерт.
     """
     await asyncio.sleep(5)
@@ -435,7 +444,7 @@ async def alerts_worker():
         alerts = get_all_active_alerts()
         print(f"[alerts_worker] Активных алертов: {len(alerts)}")
 
-        for alert_id, user_id, market_url, outcome, target_price_cents, direction in alerts:
+        for alert_id, user_id, market_url, outcome, target_price, direction in alerts:
             try:
                 slug = extract_event_slug(market_url)
                 if not slug:
@@ -457,25 +466,28 @@ async def alerts_worker():
                     print(f"[alerts_worker] Не удалось получить цену для token_id {token_id}")
                     continue
 
-                current_cents = price_usd * 100.0
+                current_price = price_usd  # 0–1 доллар
                 print(
-                    f"[alerts_worker] alert {alert_id}: price={current_cents:.2f}c, "
-                    f"target={target_price_cents}c, dir={direction}"
+                    f"[alerts_worker] alert {alert_id}: price={current_price:.4f}, "
+                    f"target={target_price:.4f}, dir={direction}"
                 )
 
                 should_trigger = False
-                if direction == ">=" and current_cents >= target_price_cents:
+                if direction == ">=" and current_price >= target_price:
                     should_trigger = True
-                elif direction == "<=" and current_cents <= target_price_cents:
+                elif direction == "<=" and current_price <= target_price:
                     should_trigger = True
 
                 if should_trigger:
+                    target_cents = target_price * 100
+                    current_cents = current_price * 100
+
                     text = (
                         f"Сработал алерт #{alert_id}!\n\n"
                         f"Рынок: {market_url}\n"
                         f"Исход: {outcome}\n"
-                        f"Целевая цена: {target_price_cents}c\n"
-                        f"Текущая цена: {current_cents:.2f}c\n"
+                        f"Целевая цена: {target_price:.4f} ({target_cents:.1f}c)\n"
+                        f"Текущая цена: {current_price:.4f} ({current_cents:.1f}c)\n"
                     )
                     try:
                         await bot.send_message(user_id, text)
