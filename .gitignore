@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 alerts.db
 .env
+.DS_Store
